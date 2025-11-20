@@ -1,8 +1,12 @@
-from fastapi import FastAPI, Depends, Query
+from fastapi import FastAPI, Depends, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from sqlmodel import Session, select
 from datetime import datetime
-from typing import List
+from typing import Dict, Any
+import asyncio
+import base64
+
+from .schemas import EmotionBatchRequest, DashboardSummaryResponse, FrameUpload
 
 from app.db import create_db_and_tables, get_session
 from app.models import PersonEmotion
@@ -36,6 +40,19 @@ app.add_middleware(
 )
 
 
+# ==========================
+# In-memory video frame store
+# ==========================
+
+LATEST_FRAMES: Dict[str, Dict[str, Any]] = {}
+# Example structure:
+# LATEST_FRAMES["jetson_1"] = {
+#     "frame": b"...jpeg bytes...",
+#     "timestamp": datetime(...)
+# }
+
+
+
 # ============================================================
 # Application Lifecycle Events
 # ============================================================
@@ -58,6 +75,67 @@ def health_check():
     Returns status to confirm the API is running.
     """
     return {"status": "ok"}
+
+
+
+
+
+@app.post("/api/stream/frame")
+async def upload_frame(payload: FrameUpload):
+    """
+    Jetson posts base64-encoded JPEG frames here.
+    We keep only the latest frame per device in memory.
+    """
+    try:
+        frame_bytes = base64.b64decode(payload.frame_b64)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid base64 frame")
+
+    LATEST_FRAMES[payload.device_id] = {
+        "frame": frame_bytes,
+        "timestamp": payload.timestamp or datetime.utcnow(),
+    }
+    return {"status": "ok"}
+
+
+
+
+
+
+
+
+async def mjpeg_generator(device_id: str):
+    """
+    Yield multipart JPEG frames for the given device_id.
+    Browser will render this as a live stream (<img src=...>).
+    """
+    boundary = b"--frame"
+
+    while True:
+        data = LATEST_FRAMES.get(device_id)
+        if data is not None:
+            frame: bytes = data["frame"]
+            yield (
+                boundary
+                + b"\r\nContent-Type: image/jpeg\r\n\r\n"
+                + frame
+                + b"\r\n"
+            )
+
+        # small sleep to avoid 100% CPU
+        await asyncio.sleep(0.1)
+
+
+@app.get("/stream/{device_id}")
+async def stream_device(device_id: str):
+    """
+    MJPEG stream endpoint for frontend.
+    """
+    return StreamingResponse(
+        mjpeg_generator(device_id),
+        media_type="multipart/x-mixed-replace; boundary=frame",
+    )
+
 
 
 @app.post("/api/emotions/batch", response_model=EmotionsBatchResponse)

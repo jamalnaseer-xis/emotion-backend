@@ -66,3 +66,13 @@ class DashboardSummaryOut(BaseModel):
 class HealthCheckResponse(BaseModel):
     """Health check response."""
     status: str
+
+
+
+
+
+
+class FrameUpload(BaseModel):
+    device_id: str
+    frame_b64: str  # base64-encoded JPEG frame
+    timestamp: Optional[datetime] = None
