@@ -1,12 +1,13 @@
-from fastapi import FastAPI, Depends, Query, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from sqlmodel import Session, select
 from datetime import datetime
-from typing import Dict, Any
+from typing import List, Dict, Any
+
 import asyncio
 import base64
 
-from .schemas import EmotionBatchRequest, DashboardSummaryResponse, FrameUpload
+from fastapi import FastAPI, Depends, Query, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+from sqlmodel import Session, select
 
 from app.db import create_db_and_tables, get_session
 from app.models import PersonEmotion
@@ -17,6 +18,7 @@ from app.schemas import (
     EmotionTotalsOut,
     PersonStateOut,
     HealthCheckResponse,
+    FrameUpload,
 )
 
 
@@ -33,24 +35,23 @@ app = FastAPI(
 # Configure CORS to allow Next.js dashboard
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],   # you can restrict to your frontend origin later
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-# ==========================
-# In-memory video frame store
-# ==========================
+# ============================================================
+# In-memory video frame store (for MJPEG streaming)
+# ============================================================
 
 LATEST_FRAMES: Dict[str, Dict[str, Any]] = {}
-# Example structure:
+# Example:
 # LATEST_FRAMES["jetson_1"] = {
 #     "frame": b"...jpeg bytes...",
 #     "timestamp": datetime(...)
 # }
-
 
 
 # ============================================================
@@ -65,7 +66,7 @@ def on_startup():
 
 
 # ============================================================
-# API Endpoints
+# Health Check
 # ============================================================
 
 @app.get("/", response_model=HealthCheckResponse)
@@ -77,8 +78,9 @@ def health_check():
     return {"status": "ok"}
 
 
-
-
+# ============================================================
+# Video Stream Upload + MJPEG Endpoint
+# ============================================================
 
 @app.post("/api/stream/frame")
 async def upload_frame(payload: FrameUpload):
@@ -96,12 +98,6 @@ async def upload_frame(payload: FrameUpload):
         "timestamp": payload.timestamp or datetime.utcnow(),
     }
     return {"status": "ok"}
-
-
-
-
-
-
 
 
 async def mjpeg_generator(device_id: str):
@@ -130,6 +126,9 @@ async def mjpeg_generator(device_id: str):
 async def stream_device(device_id: str):
     """
     MJPEG stream endpoint for frontend.
+
+    Frontend can do:
+      <img src="https://emotion-backend-production.up.railway.app/stream/jetson_1" />
     """
     return StreamingResponse(
         mjpeg_generator(device_id),
@@ -137,29 +136,25 @@ async def stream_device(device_id: str):
     )
 
 
+# ============================================================
+# Emotion Batch Ingest (Jetson → DB)
+# ============================================================
 
 @app.post("/api/emotions/batch", response_model=EmotionsBatchResponse)
 def ingest_emotions_batch(
     batch: EmotionsBatchIn,
-    session: Session = Depends(get_session)
+    session: Session = Depends(get_session),
 ):
     """
     Receive batch emotion updates from Jetson device.
 
-    This endpoint performs upsert operations:
+    Upsert logic:
     - If (device_id, person_id) exists → update cumulative times
     - If not → insert new record
-
-    Args:
-        batch: Batch of person emotion data from Jetson
-        session: Database session
-
-    Returns:
-        Status and count of updated records
     """
     # Parse the timestamp from Jetson
     try:
-        timestamp = datetime.fromisoformat(batch.timestamp.replace('Z', '+00:00'))
+        timestamp = datetime.fromisoformat(batch.timestamp.replace("Z", "+00:00"))
     except Exception:
         # Fallback to current time if parsing fails
         timestamp = datetime.utcnow()
@@ -178,7 +173,7 @@ def ingest_emotions_batch(
         # Check if record exists
         statement = select(PersonEmotion).where(
             PersonEmotion.device_id == batch.device_id,
-            PersonEmotion.person_id == person_id
+            PersonEmotion.person_id == person_id,
         )
         existing = session.exec(statement).first()
 
@@ -197,7 +192,7 @@ def ingest_emotions_batch(
                 time_happy=time_happy,
                 time_sad=time_sad,
                 time_angry=time_angry,
-                last_seen=timestamp
+                last_seen=timestamp,
             )
             session.add(new_record)
 
@@ -206,16 +201,20 @@ def ingest_emotions_batch(
     # Commit all changes
     session.commit()
 
-    return {
-        "status": "ok",
-        "updated_count": updated_count
-    }
+    return EmotionsBatchResponse(status="ok", updated_count=updated_count)
 
+
+# ============================================================
+# Dashboard Summary (DB → Frontend)
+# ============================================================
 
 @app.get("/api/dashboard/summary", response_model=DashboardSummaryOut)
 def get_dashboard_summary(
-    device_id: str = Query(default="jetson_1", description="Device ID to query"),
-    session: Session = Depends(get_session)
+    device_id: str = Query(
+        default="jetson_1",
+        description="Device ID to query",
+    ),
+    session: Session = Depends(get_session),
 ):
     """
     Get aggregated dashboard summary for a device.
@@ -224,13 +223,6 @@ def get_dashboard_summary(
     - Total emotion times across all people
     - Individual person states with current dominant emotion
     - Device metadata and last update time
-
-    Args:
-        device_id: Device ID to filter by
-        session: Database session
-
-    Returns:
-        Complete dashboard summary
     """
     # Query all person records for this device
     statement = select(PersonEmotion).where(PersonEmotion.device_id == device_id)
@@ -259,7 +251,11 @@ def get_dashboard_summary(
         current_emotion = max(emotion_times, key=emotion_times.get)
 
         # If all times are 0, default to neutral
-        if record.time_happy == 0 and record.time_sad == 0 and record.time_angry == 0:
+        if (
+            record.time_happy == 0
+            and record.time_sad == 0
+            and record.time_angry == 0
+        ):
             current_emotion = "neutral"
 
         # Build PersonStateOut
@@ -269,7 +265,7 @@ def get_dashboard_summary(
             time_happy=record.time_happy,
             time_sad=record.time_sad,
             time_angry=record.time_angry,
-            last_seen=record.last_seen.isoformat() + "Z"
+            last_seen=record.last_seen.isoformat() + "Z",
         )
         current_people.append(person_state)
 
@@ -278,16 +274,16 @@ def get_dashboard_summary(
         happy=total_happy,
         sad=total_sad,
         angry=total_angry,
-        neutral=0.0  # Not tracked yet
+        neutral=0.0,  # Not tracked yet
     )
 
     # Build final summary
     summary = DashboardSummaryOut(
         device_id=device_id,
-        device_name="Entrance Camera",  # Hardcoded for now
+        device_name="Entrance Camera",  # TODO: make configurable later
         updated_at=datetime.utcnow().isoformat() + "Z",
         emotion_totals=emotion_totals,
-        current_people=current_people
+        current_people=current_people,
     )
 
     return summary
