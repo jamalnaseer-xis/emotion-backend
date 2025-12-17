@@ -35,7 +35,10 @@ app = FastAPI(
 # Configure CORS to allow Next.js dashboard
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # you can restrict to your frontend origin later
+    allow_origins=[
+        "https://emotion-frontend-production.up.railway.app",
+        "http://localhost:3000",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
